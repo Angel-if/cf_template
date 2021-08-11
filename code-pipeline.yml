@@ -1,0 +1,385 @@
+Description: >
+  This template creates a continuous deployment pipeline which pulls
+  code from GitHub, builds via CodeBuild, and deploys via CloudFormation.
+  CodePipeline orchestrates this process.
+Parameters:
+  ApplicationName: 
+    Description: Used to name resources provisioned by this template
+    Type: String
+    Default: trust-service
+  
+  ResourcePrefix:
+    Description: Prefix for resources
+    Type: String
+    Default: brmstk
+
+  Environment:
+    Description: Environment type consists of dev|staging|prod
+    Type: String
+    Default: dev
+
+  Region:
+    Description: located region
+    Type: String
+    Default: us-east-2  
+
+#Uncomment those section in case of using Additional credential
+
+#  GitHubUser:
+#    Description: The GitHub username which owns the repository to be deployed
+#    Type: 'AWS::SSM::Parameter::Value<String>'
+#    Default: git_service_user
+
+#  GitHubOAuthToken: 
+#    Description: Create a token with 'repo' and 'admin:repo_hook' permissions here https://github.com/settings/tokens
+#    Type: 'AWS::SSM::Parameter::Value<Secure String>'
+#    NoEcho: true
+#    Default: git_token
+
+  GitHubRepository:
+    Description: The name of the repository to deploy
+    Type: String
+    Default: webpageJenkins
+
+  GitHubBranch:
+    Description: The branch of the repository to deploy
+    Type: String
+    Default: master
+
+  CodeBuildVPC:
+    Description: VPC for CodeBuild
+    Type: AWS::EC2::VPC::Id 
+    Default: vpc-0d0af31ee449510b6
+
+  CodeBuildSubnet:
+    Description: Subnet  for CodeBuild VPC
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-02bd84a37dd46e2d5
+
+  CodeBuildSecurityGroup:
+    Description: Security group  for CodeBuild VPC
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-06be3514397db1430
+
+  SSHKeyName:
+    Description: The name of the SSH keypair to use for connecting to EC2 hosts
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: brmstk-dev-us-east-2-dev_env
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: 
+          default: Application Configuration
+        Parameters:
+          - ApplicationName
+          - SSHKeyName
+      - Label:
+          default: GitHub Configuration
+        Parameters:
+          - GitHubUser
+          - GitHubRepository
+          - GitHubBranch
+          - GitHubOAuthToken
+    ParameterLabels:
+      ApplicationName: 
+        default: Application Name
+      SSHKeyName: 
+        default: SSH Key Name
+      GitHubRepository: 
+        default: Repository Name
+      #Uncomment those section in case of using Additional credential  
+      # GitHubUser: 
+      #   default: Repository Owner
+      # GitHubOAuthToken: 
+      #   default: OAuth Token        
+      GitHubBranch: 
+        default: Repository Branch
+
+
+Resources:
+  
+  # S3 bucket for build artifacts
+  S3BucketBuilds:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub ${ResourcePrefix}-${Environment}-${Region}-s3-bucket-${ApplicationName}
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - Id: "remove-old-artifacts"
+            ExpirationInDays: 3
+            NoncurrentVersionExpirationInDays: 3
+            Status: Enabled
+#Part for enabling version configuration on S3            
+      #VersioningConfiguration:
+        #Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      Tags:
+        - Key: application
+          Value: !Ref ApplicationName
+
+  # CodePipeline/CodeBuild/CodeDeploy
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ResourcePrefix}-${Environment}-${Region}-codepipeline-${ApplicationName}
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      RestartExecutionOnUpdate: false
+      ArtifactStore: 
+        Type: S3
+        Location: !Ref S3BucketBuilds
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts:
+                -  Name: GitSource
+              Configuration:
+                Owner: '{{resolve:secretsmanager:brmstk-git-credential:SecretString:git_service_user}}'
+                Repo: !Ref GitHubRepository
+                Branch: !Ref GitHubBranch
+                OAuthToken: '{{resolve:secretsmanager:brmstk-git-credential:SecretString:git_token}}'
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              InputArtifacts:
+                - Name: GitSource
+              ActionTypeId: 
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              RunOrder: 1  
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration: 
+                PrimarySource: GitSource
+                ProjectName: !Sub ${ResourcePrefix}-${Environment}-${Region}-codebuild-${ApplicationName}
+        - Name: Deploy
+          Actions:
+            - Name: DeployApp
+              RunOrder: 2
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CodeDeploy
+              Configuration: 
+                ApplicationName: !Sub ${ResourcePrefix}-${Environment}-${Region}-${ApplicationName}
+                DeploymentGroupName: !Sub ${ResourcePrefix}-${Environment}-${Region}-codedeploy-DG-${ApplicationName}
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ResourcePrefix}-${Environment}-${Region}-codebuild-${ApplicationName}
+      Description: Build project for the application
+      ServiceRole: !Ref CodeBuildRole
+      Source:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED  
+      Artifacts:
+        Type: CODEPIPELINE
+        Packaging: ZIP
+      VpcConfig:
+        VpcId: !Ref CodeBuildVPC
+        Subnets: [!Ref CodeBuildSubnet]
+        SecurityGroupIds: [!Ref CodeBuildSecurityGroup]
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      Path: /
+      RoleName: !Sub ${ResourcePrefix}-${Environment}-${Region}-iam-codepipeline-role-${ApplicationName}
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies: 
+        - PolicyName: !Sub ${ResourcePrefix}-${Environment}-${Region}-iam-policy-${ApplicationName}
+          PolicyDocument: 
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketBuilds}/*
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - iam:PassRole
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+
+  CodePipelineCloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      Path: /
+      RoleName: !Sub ${ResourcePrefix}-${Environment}-${Region}-cf-role-${ApplicationName}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ResourcePrefix}-${Environment}-${Region}-cf-policy-${ApplicationName}
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - '*'
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub ${ResourcePrefix}-${Environment}-${Region}-${ApplicationName}
+      ComputePlatform: Server
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup 
+    DependsOn:
+    - CodeDeployApplication
+    - CodePipeline
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication 
+      DeploymentGroupName: !Sub ${ResourcePrefix}-${Environment}-${Region}-codedeploy-DG-${ApplicationName}
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      Ec2TagFilters:
+        - Key: app
+          Value: trust-service
+          Type: KEY_AND_VALUE  
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      Path: /
+      RoleName: !Sub ${ResourcePrefix}-${Environment}-${Region}-codedeploy-role-${ApplicationName}
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      Path: /
+      RoleName: !Sub ${ResourcePrefix}-${Environment}-${Region}-codebuild-role-${ApplicationName}
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies: 
+        - PolicyName: !Sub ${ResourcePrefix}-${Environment}-${Region}-codebuild-policy-${ApplicationName}
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Resource: 
+                  #- arn:aws:codebuild:::report-group/*
+                  - !Sub arn:aws:codebuild:${Region}:${AWS::AccountId}:report-group/${ResourcePrefix}-${Environment}-${Region}-codebuild-${ApplicationName}*
+                  - !Sub arn:aws:logs:${Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ResourcePrefix}-${Environment}-${Region}-codebuild-${ApplicationName}
+                  - !Sub arn:aws:logs:${Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ResourcePrefix}-${Environment}-${Region}-codebuild-${ApplicationName}:*
+                  - !Sub arn:aws:logs:${Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ResourcePrefix}-${Environment}-${Region}-codebuild-${ApplicationName}:log-stream:*
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutCodeCoverages
+                  - codebuild:BatchPutTestCases
+              - Effect: Allow
+                Resource: 
+                  - !Sub arn:aws:s3:::${S3BucketBuilds}/*
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+              - Effect: Allow
+                Resource: '*'
+                Action: 
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+              - Effect: Allow
+                Resource: '*'
+                Action: 
+                  - ec2:CreateNetworkInterfacePermission
+
+
+Outputs:
+  CodePipelineURL:
+    Description: The URL to access the deployment pipeline
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${ResourcePrefix}-${Environment}-${Region}-codepipeline-${ApplicationName}
+
+  CodeDeployApplication:
+    Description: The CodeDeploy application used across all environments
+    Value: !Ref CodeDeployApplication
+    Export:
+      Name: !Sub CodeDeployApplication-${ApplicationName}
+
+  CodeDeployServiceRoleArn:
+    Description: The CodeDeploy service role used across all environments
+    Value: !GetAtt CodeDeployServiceRole.Arn
+    Export:
+      Name: !Sub CodeDeployServiceRoleArn-${ApplicationName}

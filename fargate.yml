@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Long record low latency adapter stack for care-management-events
+########################################################################
+# Parameters for deploy Hazelcast
+########################################################################
+Parameters:
+
+  AppName:
+    Description: Name of applicaion which uses in naming
+    Type: String
+    Default: trust-service
+
+  ResourcePrefix:
+    Description: Prefix for resources
+    Type: String
+    Default: brmstk
+
+  Region:
+    Description: located region
+    Type: String
+    Default: us-west-2
+
+  Environment:
+    Description: Environment type consists of dev|staging|prod
+    Type: String
+    Default: dev
+
+  VpcId:
+    Description: The identifier of the VPC for the Environment
+    Type: AWS::EC2::VPC::Id
+
+  VpcSubnets:
+    Description: List of subnets for the VPC
+    Type: List<AWS::EC2::Subnet::Id>
+
+  DesiredCount:
+    Description: Count of the running task instances
+    Type: String
+    Default: 1
+
+  Image:
+    Type: String
+    Default: 484365002481.dkr.ecr.us-east-2.amazonaws.com/hazelcast
+
+
+########################################################################
+# Resources for Hazelcast Fargete Service
+########################################################################
+Resources:
+##################################
+# SecurityGroup for ECS task
+##################################
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ResourcePrefix}-${Environment}-${Region}-${AppName}-run-ecs-service"
+      GroupDescription: !Sub "Security group for ECS task project ${ResourcePrefix}-${Environment}-${Region}-${AppName}"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5701
+          ToPort: 5702
+          CidrIp: 10.33.23.0/25 
+
+##################################
+# IAM Roles for ECS task
+##################################  
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-${Environment}-${Region}-${AppName}-iam-ecs-service-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+##################################
+# ECS cluster
+##################################
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ResourcePrefix}-${Environment}-${Region}-${AppName}-hazelcast-cluster"
+
+##################################
+# ECS task
+##################################
+  ECSTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Image: !Ref Image
+          Interactive: False
+          Name: !Sub "${ResourcePrefix}-${Environment}-${Region}-${AppName}"
+          PortMappings:
+          - ContainerPort: 5701
+          - ContainerPort: 5702
+          Privileged: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroupForECS
+              awslogs-stream-prefix: ecs
+      Cpu: "256"
+      ExecutionRoleArn: !Ref ExecutionRole
+      Family: !Sub "${ResourcePrefix}-${Environment}-${Region}-${AppName}-tasks"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+
+##################################
+# ECS service
+##################################
+  ECSservice:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref ECSTask
+      PropagateTags: SERVICE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+          Subnets: !Ref VpcSubnets
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: false
+
+##################################
+# Log group for ECS
+##################################
+  LogGroupForECS:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${Cluster}"
+      RetentionInDays: 14
+
+
+########################################################################
+# Outputs for LLLR adapter stack must be paste below
+########################################################################
+Outputs:
+  Cluster:
+    Value: !Ref Cluster
+
+  VpcSubnets:
+    Value: !Join [ ",", !Ref VpcSubnets ]
+
+  VpcId:
+    Value: !Ref VpcId

@@ -1,0 +1,23 @@
+
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup 
+    DependsOn:
+    - CodeDeployApplication
+    Properties:
+      ApplicationName: trust-app-service
+      DeploymentGroupName: trust-app-service-dg
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      ServiceRoleArn: arn:aws:iam::225327301834:role/Trust-service-deployment-role
+      Deployment:
+        Revision: 
+          RevisionType: S3 
+          S3Location: 
+            Bucket: arn:aws:s3:::trust-app
+            Key: app
+            BundleType: Zip    
+      Ec2TagFilters:
+        - Key: app
+          Value: trust-service
+          Type: KEY_AND_VALUE
+
